@@ -203,6 +203,7 @@
             <button class="tab-btn" onclick="showModule('test')">🧪 测试工具</button>
             <button class="tab-btn" onclick="showModule('apk')">📱 APK解析</button>
             <button class="tab-btn" onclick="showModule('review')">📋 用例评审</button>
+            <button class="tab-btn" onclick="showModule('commands')">📜 常用命令</button>
         </div>
     </div>
 
@@ -591,6 +592,30 @@
                 </div>
             </div>
         </div>
+
+        <!-- 常用命令模块 -->
+        <div id="module-commands" class="module-section">
+            <div class="card">
+                <h2>📜 软件测试工程师常用命令速查</h2>
+                <p style="color: #666; margin-bottom: 20px;">SQL / Linux / ADB 常用命令速查手册，按需切换下方标签切换命令分类</p>
+
+                <!-- 搜索栏 -->
+                <div style="margin-bottom: 20px;">
+                    <input type="text" id="commandSearchInput" placeholder="🔍 搜索命令，如: select, grep, adb install" style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px;" oninput="searchCommandsUI()">
+                </div>
+
+                <!-- 三种子标签 -->
+                <div class="tabs" style="margin-bottom: 20px;">
+                    <button class="tab-btn active" onclick="showCommandTab('sql', this)">💾 SQL 常用</button>
+                    <button class="tab-btn" onclick="showCommandTab('linux', this)">🐧 Linux 常用</button>
+                    <button class="tab-btn" onclick="showCommandTab('adb', this)">📱 ADB 常用</button>
+                </div>
+
+                <!-- 命令列表 -->
+                <div id="commandContent"></div>
+            </div>
+        </div>
+
     </div>
 
     <script>
@@ -1580,6 +1605,163 @@
             } else {
                 apkFileInfo.innerHTML = `<strong style="color: red;">✗ 解析失败: ${result.error}</strong>`;
             }
+        }
+
+        // ==================== 常用命令模块 JS ====================
+        var currentCommandType = 'sql';
+        var currentCommandCache = {};
+
+        // 子标签切换
+        async function showCommandTab(type, el) {
+            currentCommandType = type;
+            document.querySelectorAll('#module-commands .tabs .tab-btn').forEach(function(btn) { btn.classList.remove('active'); });
+            if (el) el.classList.add('active');
+            document.getElementById('commandSearchInput').value = '';
+            await loadCommands(type);
+        }
+
+        // 加载命令列表
+        async function loadCommands(type) {
+            var container = document.getElementById('commandContent');
+            if (currentCommandCache[type]) {
+                renderCommands(currentCommandCache[type]);
+                return;
+            }
+            try {
+                container.innerHTML = '<div style="text-align:center;padding:20px;color:#666;">⏳ 加载中...</div>';
+                var response = await fetch('/api/commands', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type: type })
+                });
+                var result = await response.json();
+                if (result.success) {
+                    currentCommandCache[type] = result.data;
+                    renderCommands(result.data);
+                } else {
+                    container.innerHTML = '<p style="color:#dc3545;">❌ 加载失败：' + result.error + '</p>';
+                }
+            } catch (err) {
+                container.innerHTML = '<p style="color:#dc3545;">❌ 加载失败：' + err.message + '</p>';
+            }
+        }
+
+        // 渲染命令列表（紧凑可折叠表格）
+        function renderCommands(categories) {
+            var container = document.getElementById('commandContent');
+            if (!categories || categories.length === 0) {
+                container.innerHTML = '<p style="text-align:center;color:#666;padding:20px;">暂无匹配结果</p>';
+                return;
+            }
+            var html = '';
+            for (var ci = 0; ci < categories.length; ci++) {
+                var cat = categories[ci];
+                var expanded = (ci === 0) ? '' : ' style="display:none;"';
+                var arrow = (ci === 0) ? '▼' : '▶';
+                html += '<div style="margin-bottom:12px;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">';
+                html += '<div class="cmd-cat-header" onclick="toggleCategory(this)" style="background:#f5f7fa;padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none;">';
+                html += '<div><span class="cat-arrow" style="font-size:11px;color:#888;margin-right:8px;">' + arrow + '</span><strong style="font-size:14px;color:#1976d2;">' + escapeHtml(cat.category) + '</strong> <span style="font-size:12px;color:#999;">(' + cat.commands.length + ' 条)</span></div>';
+                html += '<button class="copy-btn" style="font-size:11px;padding:3px 10px;" onclick="event.stopPropagation();copyCategory(\'' + escapeJs(cat.category) + '\',' + ci + ')">📋 复制全部</button>';
+                html += '</div>';
+                html += '<div class="cmd-cat-body"' + expanded + '>';
+                // 表头
+                html += '<div style="display:grid;grid-template-columns:120px 1fr 1fr 60px;background:#fafafa;border-bottom:1px solid #eee;font-size:12px;color:#888;padding:6px 12px;font-weight:bold;">';
+                html += '<div>命令</div><div>语法</div><div>示例</div><div style="text-align:center;">操作</div></div>';
+                // 数据行
+                for (var j = 0; j < cat.commands.length; j++) {
+                    var cmd = cat.commands[j];
+                    var bg = (j % 2 === 0) ? '#fff' : '#fafbfc';
+                    var safeCmd = escapeJs(cmd.command);
+                    html += '<div style="display:grid;grid-template-columns:120px 1fr 1fr 60px;background:' + bg + ';padding:7px 12px;font-size:13px;border-bottom:1px solid #f0f0f0;align-items:center;">';
+                    html += '<div style="font-weight:600;color:#333;font-family:monospace;">' + escapeHtml(cmd.command) + '</div>';
+                    html += '<div style="color:#555;font-size:12px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeHtml(cmd.syntax) + '">' + escapeHtml(cmd.syntax) + '</div>';
+                    html += '<div style="color:#0d6efd;font-size:12px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeHtml(cmd.example) + '">' + escapeHtml(cmd.example) + '</div>';
+                    html += '<div style="text-align:center;"><button class="copy-btn" style="font-size:11px;padding:2px 8px;" onclick="copyCommand(\'' + safeCmd + '\',this)" title="复制命令">📋</button></div>';
+                    html += '</div>';
+                }
+                html += '</div></div>';
+            }
+            container.innerHTML = html;
+        }
+
+        // 折叠切换
+        function toggleCategory(header) {
+            var body = header.nextElementSibling;
+            if (!body) return;
+            var arrow = header.querySelector('.cat-arrow');
+            if (body.style.display === 'none') {
+                body.style.display = '';
+                arrow.textContent = '▼';
+            } else {
+                body.style.display = 'none';
+                arrow.textContent = '▶';
+            }
+        }
+
+        // 复制分类下所有命令
+        function copyCategory(catName, idx) {
+            var data = currentCommandCache[currentCommandType];
+            if (!data || !data[idx]) return;
+            var text = data[idx].commands.map(function(c) { return c.command; }).join('\n');
+            navigator.clipboard.writeText(text).then(function() {
+                var btn = event.target;
+                var orig = btn.textContent;
+                btn.textContent = '✅ 已复制';
+                btn.style.background = '#28a745';
+                setTimeout(function() { btn.textContent = orig; btn.style.background = '#1e88e5'; }, 1200);
+            });
+        }
+
+        // HTML转义
+        function escapeHtml(text) {
+            if (!text) return '';
+            return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // JS字符串转义
+        function escapeJs(text) {
+            if (!text) return '';
+            return text.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+        }
+
+        // 复制命令到剪贴板
+        function copyCommand(text, btn) {
+            navigator.clipboard.writeText(text).then(function() {
+                var original = btn.innerHTML;
+                btn.innerHTML = '✅';
+                btn.style.background = '#28a745';
+                setTimeout(function() {
+                    btn.innerHTML = original;
+                    btn.style.background = '#1e88e5';
+                }, 1200);
+            });
+        }
+
+        // 搜索过滤
+        function searchCommandsUI() {
+            var keyword = document.getElementById('commandSearchInput').value.trim().toLowerCase();
+            var data = currentCommandCache[currentCommandType];
+            if (!data) return;
+            if (!keyword) {
+                renderCommands(data);
+                return;
+            }
+            var filtered = [];
+            for (var ci = 0; ci < data.length; ci++) {
+                var cat = data[ci];
+                var matched = [];
+                for (var j = 0; j < cat.commands.length; j++) {
+                    var cmd = cat.commands[j];
+                    var text = (cmd.command + ' ' + cmd.desc + ' ' + cmd.example).toLowerCase();
+                    if (text.indexOf(keyword) !== -1) {
+                        matched.push(cmd);
+                    }
+                }
+                if (matched.length > 0) {
+                    filtered.push({ category: cat.category, commands: matched });
+                }
+            }
+            renderCommands(filtered);
         }
     </script>
 </body>

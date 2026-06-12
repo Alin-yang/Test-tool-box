@@ -1002,7 +1002,7 @@ def generate_uuid():
 
 @web_bp.route('/api/parse-xmind', methods=['POST'])
 def parse_xmind():
-    """解析XMind文件 - 增强版"""
+    """解析XMind文件 - 兼容XMind 8 / 2020+ / 2023+ 多种格式"""
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': '请上传XMind文件'}), 400
     
@@ -1022,176 +1022,271 @@ def parse_xmind():
         file.save(xmind_path)
         
         test_cases = []
+        NS = 'urn:xmind:xmap:xmlns:content:2.0'
         
         with zipfile.ZipFile(xmind_path, 'r') as zf:
-            # 尝试读取content.xml
-            if 'content.xml' in zf.namelist():
-                xml_content = zf.read('content.xml')
-                root = ET.fromstring(xml_content)
+            # 尝试多个可能的content文件路径
+            content_paths = ['content.xml', 'content.json', 'Content.json']
+            xml_content = None
+            for cp in content_paths:
+                if cp in zf.namelist():
+                    xml_content = zf.read(cp)
+                    break
+            
+            if xml_content is None:
+                # 尝试找任何.xml文件
+                xml_files = [n for n in zf.namelist() if n.endswith('.xml')]
+                for xf in xml_files:
+                    xml_content = zf.read(xf)
+                    break
+            
+            if xml_content is None:
+                os.remove(xmind_path)
+                return jsonify({'success': False, 'error': '无法找到XMind内容文件，请确认文件有效'}), 400
+            
+            root = ET.fromstring(xml_content)
+            
+            # 通用函数：按标签局部名查找元素（忽略命名空间）
+            def find_tags(el, local_name):
+                if el.tag.endswith('}' + local_name):
+                    return True
+                return el.tag == local_name
+            
+            # 获取所有sheet或topic根节点
+            def get_all_sheets(root_elem):
+                sheets = []
+                # 尝试标准命名空间
+                for sheet in root_elem.findall(f'.//{{{NS}}}sheet'):
+                    sheets.append(sheet)
+                # 尝试无命名空间
+                if not sheets:
+                    for el in root_elem.iter():
+                        if el.tag.endswith('}sheet') or el.tag == 'sheet':
+                            sheets.append(el)
+                # 尝试直接把根元素当sheet
+                if not sheets:
+                    for el in root_elem.iter():
+                        if el.tag.endswith('}topic') and el.find(f'./{{{NS}}}title') is not None:
+                            # 直接把根topic当sheet处理
+                            fake_sheet = ET.Element('sheet')
+                            fake_sheet.append(el)
+                            sheets.append(fake_sheet)
+                            break
+                return sheets
+            
+            def get_text(el, tag_local_name):
+                """从元素中获取指定标签的文本（兼容命名空间）"""
+                ns_tag = f'{{{NS}}}{tag_local_name}'
+                child = el.find(ns_tag)
+                if child is not None:
+                    return child.text or ''
+                # 尝试无命名空间
+                for c in el:
+                    if c.tag.endswith('}' + tag_local_name) or c.tag == tag_local_name:
+                        return c.text or ''
+                return ''
+            
+            def get_children(el, tag_local_name='topic'):
+                """获取指定标签名的子元素（兼容命名空间）"""
+                ns_tag = f'{{{NS}}}{tag_local_name}'
+                children = el.findall(ns_tag)
+                if children:
+                    return children
+                # 尝试通过topics包装层
+                topics_wrapper = el.find(f'{{{NS}}}topics')
+                if topics_wrapper is not None:
+                    children = topics_wrapper.findall(ns_tag)
+                    if children:
+                        return children
+                # 尝试无命名空间
+                result = []
+                for c in el:
+                    if c.tag.endswith('}' + tag_local_name) or c.tag == tag_local_name:
+                        result.append(c)
+                    elif c.tag.endswith('}topics') or c.tag == 'topics':
+                        for cc in c:
+                            if cc.tag.endswith('}' + tag_local_name) or cc.tag == tag_local_name:
+                                result.append(cc)
+                return result
+            
+            def extract_case_from_topic(topic, depth=0, path=''):
+                """从topic节点递归提取测试用例"""
+                title = get_text(topic, 'title')
+                if not title:
+                    return
                 
-                ns = {'x': 'urn:xmind:xmap:xmlns:content:2.0'}
+                current_path = path + ' / ' + title if path else title
+                children = get_children(topic)
                 
-                # 获取所有sheet中的topic（使用不同的命名空间）
-                sheets = root.findall('.//{urn:xmind:xmap:xmlns:content:2.0}sheet')
+                # 判断当前节点是否为测试用例节点
+                title_lower = title.lower()
                 
-                for sheet in sheets:
-                    # 获取sheet标题
-                    sheet_title = ''
-                    title_elem = sheet.find('./{urn:xmind:xmap:xmlns:content:2.0}title')
-                    if title_elem is not None:
-                        sheet_title = title_elem.text or ''
+                # 检查是否有步骤/预期等子节点标识（深度>=1的节点）
+                has_step_children = False
+                for child in children:
+                    child_title = get_text(child, 'title').lower()
+                    if any(kw in child_title for kw in ['步骤', 'step', '预期', 'expected', '期望', '优先级', 'priority', '前置', 'precondition']):
+                        has_step_children = True
+                        break
+                
+                # 是测试用例的条件
+                is_test_case = False
+                if depth >= 1 and children and has_step_children:
+                    is_test_case = True
+                elif depth >= 1 and title and any(kw in title_lower for kw in ['用例', '测试', 'tc-', 'test', 'case']):
+                    is_test_case = True
+                # 深度>=2且有子节点也当作用例
+                elif depth >= 2 and len(children) >= 1:
+                    is_test_case = True
+                
+                if is_test_case:
+                    # 创建新用例
+                    case_id = ''
+                    case_name = title
                     
-                    # 获取根主题
-                    root_topic = sheet.find('.//{urn:xmind:xmap:xmlns:content:2.0}topic')
-                    if root_topic is None:
-                        continue
+                    id_match = re.search(r'(TC-\d+|用例\d+|ID:\s*\d+)', title)
+                    if id_match:
+                        case_id = id_match.group(1).replace('ID:', '').strip()
+                        case_name = title.replace(id_match.group(1), '').strip()
                     
-                    # 递归解析主题
-                    def parse_topic(topic, parent_case=None, depth=0):
-                        title_elem = topic.find('./{urn:xmind:xmap:xmlns:content:2.0}title')
-                        title = title_elem.text if title_elem is not None else ''
-                        
-                        if not title:
-                            return parent_case
-                        
-                        # 获取子主题
-                        child_topics = topic.findall('./{urn:xmind:xmap:xmlns:content:2.0}topic')
-                        has_children = len(child_topics) > 0
-                        
-                        # 判断是否为测试用例节点
-                        is_case_node = False
-                        title_lower = title.lower()
-                        
-                        # 检查标题中是否包含用例标识
-                        case_keywords = ['用例', '测试用例', 'tc-', 'test case', 'testcase', '测试点']
-                        for kw in case_keywords:
-                            if kw in title_lower:
-                                is_case_node = True
-                                break
-                        
-                        # 如果有子节点且深度合适，也可能是用例
-                        if not is_case_node and has_children and depth > 0:
-                            # 检查是否有"步骤"、"预期"等子节点标识
-                            for child in child_topics:
-                                child_title_elem = child.find('./{urn:xmind:xmap:xmlns:content:2.0}title')
-                                child_title = child_title_elem.text if child_title_elem else ''
-                                if any(kw in child_title.lower() for kw in ['步骤', 'step', '预期', 'expected', '优先级', 'priority']):
-                                    is_case_node = True
-                                    break
-                        
-                        if is_case_node and has_children:
-                            # 新的测试用例
-                            case_id = ''
-                            case_name = title
-                            
-                            # 尝试从标题提取ID
-                            id_match = re.search(r'(TC-\d+|用例\d+|ID:\s*\d+)', title)
-                            if id_match:
-                                case_id = id_match.group(1).replace('ID:', '').strip()
-                                case_name = title.replace(id_match.group(1), '').strip()
-                            
-                            new_case = {
-                                'id': case_id,
-                                'name': case_name or '未命名用例',
-                                'description': '',
-                                'priority': 'P2',
-                                'type': '功能测试',
-                                'test_steps': [],
-                                'test_data': {},
-                                'expected': '',
-                                'preconditions': ''
-                            }
-                            
-                            test_cases.append(new_case)
-                            
-                            # 递归解析子节点
-                            for child in child_topics:
-                                parse_topic(child, new_case, depth + 1)
-                            
-                            return new_case
-                        elif parent_case and title:
-                            # 在测试用例下解析子节点
-                            title_lower = title.lower()
-                            
-                            # 检查优先级
-                            priority_keywords = ['priority', '优先级', 'p0', 'p1', 'p2', '高', '中', '低']
-                            if any(kw in title_lower for kw in priority_keywords):
-                                priority_map = {
-                                    'p0': 'P0', '高': 'P0', '最高': 'P0',
-                                    'p1': 'P1', '中': 'P1', '中等': 'P1',
-                                    'p2': 'P2', '低': 'P2', '最低': 'P2'
-                                }
-                                # 提取优先级值
-                                priority_value = title_lower.strip()
-                                for key in priority_map:
-                                    priority_value = priority_value.replace(key, '').strip()
-                                if not priority_value:
-                                    priority_value = title_lower.strip()
-                                parent_case['priority'] = priority_map.get(priority_value, 'P2')
-                            
-                            # 检查类型
-                            elif any(kw in title_lower for kw in ['类型', 'type', '功能', '接口', '性能', '安全']):
-                                type_map = {
-                                    '功能': '功能测试', '功能测试': '功能测试',
-                                    '接口': '接口测试', '接口测试': '接口测试',
-                                    '性能': '性能测试', '性能测试': '性能测试',
-                                    '安全': '安全测试', '安全测试': '安全测试',
-                                    'ui': 'UI测试', '界面': 'UI测试'
-                                }
-                                clean_title = title.replace('类型', '').replace('type', '').strip()
-                                parent_case['type'] = type_map.get(clean_title, '功能测试')
-                            
-                            # 检查描述
-                            elif any(kw in title_lower for kw in ['描述', 'description', '说明', '概述']):
-                                parent_case['description'] = title.replace('描述', '').replace('说明', '').replace('概述', '').strip()
-                            
-                            # 检查前置条件
-                            elif any(kw in title_lower for kw in ['前置条件', 'precondition', '前提条件', '前提']):
-                                parent_case['preconditions'] = title.replace('前置条件', '').replace('前提条件', '').replace('前提', '').strip()
-                            
-                            # 检查预期结果
-                            elif any(kw in title_lower for kw in ['预期', 'expected', '期望', '预期结果']):
-                                parent_case['expected'] = title.replace('预期', '').replace('期望', '').replace('预期结果', '').strip()
-                            
-                            # 检查测试数据
-                            elif any(kw in title_lower for kw in ['测试数据', 'data', '参数', '输入数据']):
-                                parent_case['test_data'] = {'title': title}
-                            
-                            # 检查是否是步骤（包含数字或关键字）
-                            else:
-                                step_keywords = ['步骤', 'step', '操作', 'action']
-                                has_step_keyword = any(kw in title_lower for kw in step_keywords)
-                                has_number = bool(re.search(r'\d+', title))
-                                
-                                if has_step_keyword or has_number or depth >= 3:
-                                    # 解析步骤
-                                    step_match = re.match(r'(\d+)[.、.。]?\s*(.*)', title)
-                                    if step_match:
-                                        step_num = int(step_match.group(1))
-                                        step_desc = step_match.group(2).strip()
-                                    else:
-                                        step_num = len(parent_case['test_steps']) + 1
-                                        step_desc = title
-                                    
-                                    parent_case['test_steps'].append({
-                                        'step': step_num,
-                                        'action': step_desc,
-                                        'expected': ''
-                                    })
-                            
-                            # 继续递归解析子节点
-                            for child in child_topics:
-                                parse_topic(child, parent_case, depth + 1)
-                        
-                        else:
-                            # 继续递归解析子节点（非用例节点）
-                            for child in child_topics:
-                                parse_topic(child, parent_case, depth + 1)
-                        
-                        return parent_case
+                    new_case = {
+                        'id': case_id,
+                        'name': case_name or title,
+                        'description': '',
+                        'priority': 'P2',
+                        'type': '功能测试',
+                        'test_steps': [],
+                        'test_data': {},
+                        'expected': '',
+                        'preconditions': ''
+                    }
                     
-                    # 开始解析
-                    parse_topic(root_topic, None, 0)
+                    test_cases.append(new_case)
+                    
+                    # 递归处理子节点作为用例属性
+                    for child in children:
+                        parse_case_attributes(child, new_case)
+                    return new_case
+                else:
+                    # 非用例节点，继续向下查找
+                    for child in children:
+                        extract_case_from_topic(child, depth + 1, current_path)
+            
+            def parse_case_attributes(topic, current_case):
+                """解析测试用例的属性（步骤、预期、优先级等）"""
+                title = get_text(topic, 'title')
+                if not title:
+                    return
+                
+                title_lower = title.lower()
+                children = get_children(topic)
+                
+                # 优先级
+                if any(kw in title_lower for kw in ['优先级', 'priority', 'p0', 'p1', 'p2', '高', '中', '低']):
+                    priority_map = {
+                        'p0': 'P0', '高': 'P0', '最高': 'P0',
+                        'p1': 'P1', '中': 'P1', '中等': 'P1',
+                        'p2': 'P2', '低': 'P2', '最低': 'P2'
+                    }
+                    val = title_lower.strip()
+                    for k, v in priority_map.items():
+                        if k in val:
+                            current_case['priority'] = v
+                            break
+                    return
+                
+                # 类型
+                if any(kw in title_lower for kw in ['类型', 'type']):
+                    clean = title.replace('类型', '').replace('type', '').strip()
+                    type_map = {'功能': '功能测试', '接口': '接口测试', '性能': '性能测试', '安全': '安全测试'}
+                    for k, v in type_map.items():
+                        if k in clean.lower():
+                            current_case['type'] = v
+                            return
+                    return
+                
+                # 描述
+                if any(kw in title_lower for kw in ['描述', 'description', '说明', '概述']):
+                    for kw in ['描述', 'description', '说明', '概述']:
+                        title = title.replace(kw, '').strip()
+                    current_case['description'] = title
+                    return
+                
+                # 前置条件
+                if any(kw in title_lower for kw in ['前置条件', 'precondition', '前提条件', '前提']):
+                    for kw in ['前置条件', 'precondition', '前提条件', '前提']:
+                        title = title.replace(kw, '').strip()
+                    current_case['preconditions'] = title
+                    return
+                
+                # 预期结果
+                if any(kw in title_lower for kw in ['预期', 'expected', '期望结果', '预期结果']):
+                    for kw in ['预期结果', '期望结果', 'expected', '预期', '期望']:
+                        title = title.replace(kw, '').strip()
+                    title = title.lstrip('：:').strip()
+                    current_case['expected'] = title
+                    return
+                
+                # 测试数据
+                if any(kw in title_lower for kw in ['测试数据', '测试参数', '数据', 'data', '参数']):
+                    current_case['test_data'] = {'title': title}
+                    return
+                
+                # 步骤解析（包含数字或步骤关键字）
+                is_step = False
+                if any(kw in title_lower for kw in ['步骤', 'step', '操作', 'action']):
+                    is_step = True
+                if re.search(r'^\d+[.、.。]?\s*', title):
+                    is_step = True
+                # 剩余的子节点也作为步骤
+                if not is_step and not children:
+                    is_step = True
+                
+                if is_step:
+                    step_match = re.match(r'(\d+)[.、.。]?\s*(.*)', title)
+                    if step_match:
+                        step_num = int(step_match.group(1))
+                        step_desc = step_match.group(2).strip()
+                    else:
+                        step_num = len(current_case['test_steps']) + 1
+                        step_desc = title
+                    # 清理步骤文本中的"步骤N："前缀
+                    step_desc = re.sub(r'^(步骤|step|操作|action)\s*\d*\s*[：:,.，。]?\s*', '', step_desc, flags=re.IGNORECASE).strip()
+                    if not step_desc:
+                        step_desc = title
+                    
+                    # 递归检查子节点是否为预期结果
+                    step_expected = ''
+                    for child in children:
+                        ct = get_text(child, 'title').lower()
+                        if any(kw in ct for kw in ['预期', 'expected', '期望']):
+                            step_expected = get_text(child, 'title')
+                            for kw in ['预期', '期望', 'expected']:
+                                step_expected = step_expected.replace(kw, '').strip() if kw in step_expected else step_expected
+                            break
+                    
+                    current_case['test_steps'].append({
+                        'step': step_num,
+                        'action': step_desc,
+                        'expected': step_expected
+                    })
+                    
+                    # 继续解析其他子节点
+                    for child in children:
+                        parse_case_attributes(child, current_case)
+                    return
+                
+                # 默认：继续递归解析子节点
+                for child in children:
+                    parse_case_attributes(child, current_case)
+            
+            # 主流程：从所有sheet中提取用例
+            sheets = get_all_sheets(root)
+            for sheet in sheets:
+                # 先尝试找topic根节点
+                topics = get_children(sheet)
+                for topic in topics:
+                    extract_case_from_topic(topic, 0)
         
         os.remove(xmind_path)
         
@@ -1336,3 +1431,197 @@ def parse_apk():
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': f'解析失败: {str(e)}'}), 500
+
+
+# ==================== 常用命令模块 ====================
+
+SQL_COMMANDS = {
+    '基础查询': [
+        {'command': 'SELECT', 'syntax': 'SELECT 列 FROM 表', 'example': 'SELECT id, name FROM users;', 'desc': '从表中查询数据'},
+        {'command': 'WHERE', 'syntax': 'SELECT ... WHERE 条件', 'example': "SELECT * FROM users WHERE age > 18;", 'desc': '按条件筛选数据'},
+        {'command': 'ORDER BY', 'syntax': 'SELECT ... ORDER BY 列 [ASC|DESC]', 'example': 'SELECT * FROM users ORDER BY created_at DESC;', 'desc': '对查询结果排序'},
+        {'command': 'GROUP BY', 'syntax': 'SELECT 列, 聚合函数 FROM 表 GROUP BY 列', 'example': 'SELECT city, COUNT(*) FROM users GROUP BY city;', 'desc': '按列分组聚合'},
+        {'command': 'LIMIT', 'syntax': 'SELECT ... LIMIT 数量 OFFSET 偏移', 'example': 'SELECT * FROM users LIMIT 10 OFFSET 20;', 'desc': '限制返回行数（分页）'},
+        {'command': 'DISTINCT', 'syntax': 'SELECT DISTINCT 列 FROM 表', 'example': 'SELECT DISTINCT city FROM users;', 'desc': '去重查询'},
+        {'command': 'IN', 'syntax': 'SELECT ... WHERE 列 IN (值)', 'example': 'SELECT * FROM users WHERE id IN (1,2,3);', 'desc': '匹配值列表'},
+        {'command': 'BETWEEN', 'syntax': 'SELECT ... WHERE 列 BETWEEN a AND b', 'example': 'SELECT * FROM users WHERE age BETWEEN 18 AND 30;', 'desc': '范围查询'},
+        {'command': 'LIKE', 'syntax': 'SELECT ... WHERE 列 LIKE 模式', 'example': "SELECT * FROM users WHERE name LIKE '张%';", 'desc': '模糊匹配'},
+    ],
+    '连接与子查询': [
+        {'command': 'INNER JOIN', 'syntax': '表1 JOIN 表2 ON 条件', 'example': 'SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;', 'desc': '内连接'},
+        {'command': 'LEFT JOIN', 'syntax': '表1 LEFT JOIN 表2 ON 条件', 'example': 'SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;', 'desc': '左连接（保留左表全部）'},
+        {'command': 'RIGHT JOIN', 'syntax': '表1 RIGHT JOIN 表2 ON 条件', 'example': 'SELECT * FROM users u RIGHT JOIN orders o ON u.id = o.user_id;', 'desc': '右连接'},
+        {'command': 'UNION', 'syntax': '查询1 UNION 查询2', 'example': 'SELECT id FROM users UNION SELECT id FROM orders;', 'desc': '合并查询结果并去重'},
+        {'command': '子查询', 'syntax': 'WHERE 列 IN (SELECT ...)', 'example': "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);", 'desc': '嵌套查询'},
+    ],
+    '数据定义与操纵': [
+        {'command': 'CREATE TABLE', 'syntax': 'CREATE TABLE 表 (列 类型, ...)', 'example': 'CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50));', 'desc': '创建表'},
+        {'command': 'ALTER TABLE', 'syntax': 'ALTER TABLE 表 ADD/MODIFY 列', 'example': 'ALTER TABLE users ADD COLUMN email VARCHAR(100);', 'desc': '修改表结构'},
+        {'command': 'DROP TABLE', 'syntax': 'DROP TABLE 表名', 'example': 'DROP TABLE test_users;', 'desc': '删除表（谨慎）'},
+        {'command': 'INSERT', 'syntax': 'INSERT INTO 表 (列) VALUES (值)', 'example': "INSERT INTO users (name, age) VALUES ('张三', 25);", 'desc': '插入记录'},
+        {'command': 'UPDATE', 'syntax': 'UPDATE 表 SET 列=值 WHERE 条件', 'example': "UPDATE users SET age = 26 WHERE id = 1;", 'desc': '更新记录（务必加WHERE）'},
+        {'command': 'DELETE', 'syntax': 'DELETE FROM 表 WHERE 条件', 'example': 'DELETE FROM users WHERE id = 999;', 'desc': '删除记录（务必加WHERE）'},
+        {'command': 'TRUNCATE', 'syntax': 'TRUNCATE TABLE 表名', 'example': 'TRUNCATE TABLE test_users;', 'desc': '清空表（不可回滚）'},
+        {'command': 'CREATE INDEX', 'syntax': 'CREATE INDEX 索引名 ON 表(列)', 'example': 'CREATE INDEX idx_email ON users(email);', 'desc': '创建索引加速查询'},
+    ],
+    '函数与高级': [
+        {'command': 'COUNT', 'syntax': 'SELECT COUNT(*) FROM 表', 'example': 'SELECT COUNT(*) FROM users;', 'desc': '统计行数'},
+        {'command': 'SUM / AVG', 'syntax': 'SUM(列) / AVG(列)', 'example': 'SELECT SUM(amount), AVG(amount) FROM orders;', 'desc': '求和与平均值'},
+        {'command': 'MAX / MIN', 'syntax': 'MAX(列) / MIN(列)', 'example': 'SELECT MAX(age), MIN(age) FROM users;', 'desc': '求最大值与最小值'},
+        {'command': 'HAVING', 'syntax': 'GROUP BY ... HAVING 条件', 'example': 'SELECT city, COUNT(*) FROM users GROUP BY city HAVING COUNT(*) > 10;', 'desc': '对聚合结果筛选'},
+        {'command': 'EXPLAIN', 'syntax': 'EXPLAIN SELECT ...', 'example': "EXPLAIN SELECT * FROM users WHERE email = 'x@x.com';", 'desc': '查看查询执行计划'},
+        {'command': 'CASE WHEN', 'syntax': 'CASE WHEN 条件 THEN 值 ELSE 值 END', 'example': "SELECT name, CASE WHEN age>=18 THEN '成年' ELSE '未成年' END AS status FROM users;", 'desc': '条件表达式'},
+        {'command': '事务', 'syntax': 'BEGIN; ... COMMIT / ROLLBACK;', 'example': 'BEGIN; UPDATE accounts SET money=money-100 WHERE id=1; COMMIT;', 'desc': '事务（原子操作）'},
+    ],
+}
+
+LINUX_COMMANDS = {
+    '文件目录操作': [
+        {'command': 'ls', 'syntax': 'ls [-l -a -h] [路径]', 'example': 'ls -lah /home/user', 'desc': '列出目录内容'},
+        {'command': 'cd', 'syntax': 'cd 路径', 'example': 'cd /var/log', 'desc': '切换目录'},
+        {'command': 'pwd', 'syntax': 'pwd', 'example': 'pwd', 'desc': '显示当前路径'},
+        {'command': 'cp', 'syntax': 'cp [-r] 源 目标', 'example': 'cp -r src/ backup/', 'desc': '复制文件/目录'},
+        {'command': 'mv', 'syntax': 'mv 源 目标', 'example': 'mv a.txt b.txt', 'desc': '移动或重命名'},
+        {'command': 'rm', 'syntax': 'rm [-r -f] 文件', 'example': 'rm -rf temp/', 'desc': '删除文件（-r递归 -f强制）'},
+        {'command': 'mkdir', 'syntax': 'mkdir [-p] 目录', 'example': 'mkdir -p a/b/c', 'desc': '创建目录（-p递归创建）'},
+        {'command': 'find', 'syntax': 'find 路径 -name "模式"', 'example': 'find /tmp -name "*.log" -mtime -7', 'desc': '按名称/时间查找文件'},
+    ],
+    '文本内容查看': [
+        {'command': 'cat', 'syntax': 'cat 文件', 'example': 'cat /etc/hosts', 'desc': '查看小文件内容'},
+        {'command': 'head', 'syntax': 'head -n N 文件', 'example': 'head -20 app.log', 'desc': '查看文件前N行'},
+        {'command': 'tail', 'syntax': 'tail [-n N -f] 文件', 'example': 'tail -f app.log | grep ERROR', 'desc': '查看末尾 / 实时追踪日志'},
+        {'command': 'less', 'syntax': 'less 文件', 'example': 'less /var/log/syslog', 'desc': '分页查看大文件（q退出 /搜索）'},
+        {'command': 'grep', 'syntax': 'grep [选项] 模式 文件', 'example': 'grep -n "ERROR" app.log', 'desc': '搜索文本（-n行号 -i忽略大小写）'},
+        {'command': 'wc', 'syntax': 'wc [-l -w -c] 文件', 'example': 'wc -l app.log', 'desc': '统计行数/单词数'},
+        {'command': 'sort / uniq', 'syntax': 'sort | uniq -c', 'example': 'cat log | sort | uniq -c | sort -rn', 'desc': '排序去重并统计出现次数'},
+        {'command': 'awk', 'syntax': "awk '{print $N}' 文件", 'example': "awk '{print $1}' access.log | sort | uniq -c", 'desc': '按列提取文本'},
+    ],
+    '系统进程监控': [
+        {'command': 'top', 'syntax': 'top / htop', 'example': 'top', 'desc': '实时进程与资源占用（q退出）'},
+        {'command': 'ps', 'syntax': 'ps [-aux -ef]', 'example': 'ps aux | grep java', 'desc': '查看运行进程'},
+        {'command': 'kill', 'syntax': 'kill [-9] PID', 'example': 'kill -9 12345', 'desc': '结束进程（-9强制杀死）'},
+        {'command': 'df', 'syntax': 'df -h', 'example': 'df -h', 'desc': '查看磁盘空间'},
+        {'command': 'du', 'syntax': 'du -sh [路径]', 'example': 'du -sh /var/log/*', 'desc': '查看目录/文件大小'},
+        {'command': 'free', 'syntax': 'free [-h -m -g]', 'example': 'free -g', 'desc': '查看内存使用'},
+        {'command': 'lsof', 'syntax': 'lsof -i:端口', 'example': 'lsof -i:8080', 'desc': '查看端口占用进程'},
+    ],
+    '网络与权限': [
+        {'command': 'curl', 'syntax': 'curl [选项] URL', 'example': 'curl -i http://api.test.com/users', 'desc': 'HTTP请求（接口调试）'},
+        {'command': 'wget', 'syntax': 'wget [-O 新名] URL', 'example': 'wget http://test.com/file.zip', 'desc': '下载文件'},
+        {'command': 'ping', 'syntax': 'ping 主机 [-c N]', 'example': 'ping baidu.com -c 4', 'desc': '测试网络连通性'},
+        {'command': 'ssh', 'syntax': 'ssh 用户@主机', 'example': 'ssh root@192.168.1.100', 'desc': '远程登录服务器'},
+        {'command': 'chmod', 'syntax': 'chmod 权限 文件', 'example': 'chmod 755 script.sh', 'desc': '修改文件权限（r=4 w=2 x=1）'},
+        {'command': 'chown', 'syntax': 'chown 用户:组 文件', 'example': 'chown -R app:app /data/', 'desc': '修改文件所有者'},
+        {'command': 'systemctl', 'syntax': 'systemctl start/stop/status 服务', 'example': 'systemctl restart nginx', 'desc': '管理系统服务'},
+    ],
+}
+
+ADB_COMMANDS = {
+    '设备连接管理': [
+        {'command': 'adb devices', 'syntax': 'adb devices', 'example': 'adb devices -l', 'desc': '列出已连接设备'},
+        {'command': 'adb connect', 'syntax': 'adb connect IP:端口', 'example': 'adb connect 192.168.1.100:5555', 'desc': 'WiFi连接设备'},
+        {'command': 'adb disconnect', 'syntax': 'adb disconnect [IP]', 'example': 'adb disconnect 192.168.1.100', 'desc': '断开WiFi连接'},
+        {'command': 'adb -s', 'syntax': 'adb -s 设备ID 命令', 'example': 'adb -s emulator-5554 shell', 'desc': '多设备时指定设备'},
+        {'command': 'adb kill-server', 'syntax': 'adb kill-server && adb start-server', 'example': 'adb kill-server && adb start-server', 'desc': '重启ADB服务'},
+        {'command': 'adb version', 'syntax': 'adb version', 'example': 'adb version', 'desc': '查看ADB版本'},
+    ],
+    '应用安装管理': [
+        {'command': 'adb install', 'syntax': 'adb install [-r -t -d] APK', 'example': 'adb install -r app-debug.apk', 'desc': '安装APK（-r覆盖 -t测试包）'},
+        {'command': 'adb uninstall', 'syntax': 'adb uninstall 包名', 'example': 'adb uninstall com.example.app', 'desc': '卸载应用'},
+        {'command': 'pm list packages', 'syntax': 'adb shell pm list packages [-3 -s]', 'example': 'adb shell pm list packages -3', 'desc': '列出已安装包（-3第三方）'},
+        {'command': 'pm clear', 'syntax': 'adb shell pm clear 包名', 'example': 'adb shell pm clear com.example.app', 'desc': '清除应用数据'},
+        {'command': 'am start', 'syntax': 'adb shell am start -n 包名/Activity', 'example': 'adb shell am start -n com.example.app/.MainActivity', 'desc': '启动指定Activity'},
+        {'command': 'am force-stop', 'syntax': 'adb shell am force-stop 包名', 'example': 'adb shell am force-stop com.example.app', 'desc': '强制停止应用'},
+    ],
+    '日志与截图': [
+        {'command': 'adb logcat', 'syntax': 'adb logcat [选项]', 'example': 'adb logcat -v time -d > crash.log', 'desc': '查看Android日志'},
+        {'command': 'logcat 过滤', 'syntax': 'adb logcat TAG:LEVEL *:E', 'example': 'adb logcat MyApp:D *:E', 'desc': '按标签/级别过滤日志'},
+        {'command': 'logcat grep', 'syntax': 'adb logcat | grep 关键词', 'example': 'adb logcat | grep -i "crash"', 'desc': '只看关键词日志'},
+        {'command': 'logcat -c', 'syntax': 'adb logcat -c && adb logcat', 'example': 'adb logcat -c && adb logcat -v time', 'desc': '清空缓冲区后重录日志'},
+        {'command': 'screencap', 'syntax': 'adb exec-out screencap -p > 文件', 'example': 'adb exec-out screencap -p > bug.png', 'desc': '截取屏幕保存到本地'},
+        {'command': 'screenrecord', 'syntax': 'adb shell screenrecord [时长] 路径', 'example': 'adb shell screenrecord --time-limit 30 /sdcard/bug.mp4', 'desc': '录屏（复现Bug）'},
+    ],
+    '模拟输入操作': [
+        {'command': 'input tap', 'syntax': 'adb shell input tap X Y', 'example': 'adb shell input tap 500 800', 'desc': '点击屏幕坐标'},
+        {'command': 'input swipe', 'syntax': 'adb shell input swipe X1 Y1 X2 Y2 [ms]', 'example': 'adb shell input swipe 100 800 800 800 300', 'desc': '滑动屏幕'},
+        {'command': 'input text', 'syntax': 'adb shell input text "字符串"', 'example': 'adb shell input text "hello world"', 'desc': '输入文本（空格用%s）'},
+        {'command': 'input keyevent', 'syntax': 'adb shell input keyevent 键码', 'example': 'adb shell input keyevent 4（返回键）', 'desc': '模拟按键（3=HOME 4=BACK 26=电源）'},
+    ],
+    '系统调试与性能': [
+        {'command': 'adb shell', 'syntax': 'adb shell', 'example': 'adb shell', 'desc': '进入设备Shell命令行'},
+        {'command': 'adb dumpsys', 'syntax': 'adb shell dumpsys [子系统]', 'example': 'adb shell dumpsys meminfo com.example.app', 'desc': '查看内存/Activity等系统状态'},
+        {'command': 'adb shell top', 'syntax': 'adb shell top [-m N]', 'example': 'adb shell top -m 10 -d 2 -s cpu', 'desc': '查看进程CPU/内存占用'},
+        {'command': 'adb reboot', 'syntax': 'adb reboot [bootloader]', 'example': 'adb reboot bootloader', 'desc': '重启 / 进入Fastboot'},
+        {'command': 'getprop', 'syntax': 'adb shell getprop [键]', 'example': 'adb shell getprop ro.build.version.release', 'desc': '获取系统属性（Android版本等）'},
+        {'command': 'bugreport', 'syntax': 'adb bugreport [路径]', 'example': 'adb bugreport ./bugreport.zip', 'desc': '导出完整Bug报告'},
+    ],
+}
+
+
+@web_bp.route('/api/commands', methods=['POST'])
+def get_commands():
+    """获取常用命令列表（sql / linux / adb）"""
+    try:
+        data = request.get_json() or {}
+        cmd_type = data.get('type', 'sql')
+        
+        mapping = {
+            'sql': SQL_COMMANDS,
+            'linux': LINUX_COMMANDS,
+            'adb': ADB_COMMANDS
+        }
+        
+        commands = mapping.get(cmd_type)
+        if commands is None:
+            return jsonify({'success': False, 'error': f'不支持的命令类型: {cmd_type}'}), 400
+        
+        # 按分类组织返回
+        categories = []
+        for cat_name, cmd_list in commands.items():
+            categories.append({
+                'category': cat_name,
+                'commands': cmd_list
+            })
+        
+        return jsonify({'success': True, 'data': categories})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@web_bp.route('/api/commands/search', methods=['POST'])
+def search_commands():
+    """搜索命令（在所有三类命令中搜索关键字）"""
+    try:
+        data = request.get_json() or {}
+        keyword = (data.get('keyword') or '').strip().lower()
+        cmd_type = data.get('type', '')  # 可选：限定某一类
+        
+        if not keyword:
+            return jsonify({'success': True, 'data': []})
+        
+        mapping = {
+            'sql': SQL_COMMANDS,
+            'linux': LINUX_COMMANDS,
+            'adb': ADB_COMMANDS
+        }
+        
+        sources = [(cmd_type, mapping[cmd_type])] if cmd_type in mapping else list(mapping.items())
+        
+        results = []
+        for t_name, cmd_map in sources:
+            for cat_name, cmd_list in cmd_map.items():
+                for cmd in cmd_list:
+                    text = f"{cmd['command']} {cmd.get('desc', '')} {cmd.get('example', '')}".lower()
+                    if keyword in text:
+                        cmd_copy = dict(cmd)
+                        cmd_copy['type'] = t_name
+                        cmd_copy['category'] = cat_name
+                        results.append(cmd_copy)
+        
+        return jsonify({'success': True, 'data': results[:100]})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
